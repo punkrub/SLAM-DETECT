@@ -1,0 +1,6 @@
+[submodule "SLAM"]
+	path = SLAM
+	url = https://github.com/nathon-aie/SLAM.git
+[submodule "RoboMaster-SDK"]
+	path = RoboMaster-SDK
+	url = https://github.com/dji-sdk/RoboMaster-SDK.git
