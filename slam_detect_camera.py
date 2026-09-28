@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from detect_camera import detect_signs
+from sign_vision import MIN_SHAPE_CONFIDENCE, detect_signs
 from SLAM.src.grid_slam import DIRECTIONS, NAMES, DFSExplorer, wrap
 from SLAM.src.settings import get as setting
 from SLAM.src.settings import project_path
@@ -128,12 +128,14 @@ def inspect_walls_during_scan(explorer, inspection, lock, finished):
                     continue
 
                 with lock:
+                    inspection["inspection_id"] = inspection.get("inspection_id", 0) + 1
                     inspection.update({
                         "active": True,
                         "cell": tuple(explorer.slam.cell),
                         "direction": direction,
                         "tof_distance_mm": distance_mm,
                         "frame_count": 0,
+                        "view_offset": 0.0,
                     })
 
                 sweep_yaws = [
@@ -148,7 +150,7 @@ def inspect_walls_during_scan(explorer, inspection, lock, finished):
                 deadline = time.monotonic() + SIGN_INSPECTION_TIMEOUT_SEC
                 dwell_per_yaw = SIGN_INSPECTION_TIMEOUT_SEC / max(1, len(sweep_yaws))
                 for sweep_yaw in sweep_yaws:
-                    if finished.is_set() or not backend.controller._running.is_set():
+                    if finished.is_set() or not backend.controller.is_running():
                         break
                     with lock:
                         inspection["active"] = False
@@ -171,6 +173,7 @@ def inspect_walls_during_scan(explorer, inspection, lock, finished):
                             inspection["direction"] = direction
                             inspection["tof_distance_mm"] = distance_mm
                             inspection["camera_yaw"] = sweep_yaw
+                            inspection["view_offset"] = sweep_yaw - camera_yaw
                             inspection["active"] = True
                         dwell_deadline = min(
                             deadline, time.monotonic() + dwell_per_yaw
@@ -210,6 +213,28 @@ def inspect_walls_during_scan(explorer, inspection, lock, finished):
 def save_sign_marks(output, marks):
     path = Path(output)
     data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data["map_info"]["rows"]
+    columns = data["map_info"]["columns"]
+    visited = {tuple(cell) for cell in data.get("visited", [])}
+    known_edges = {
+        tuple(sorted(tuple(cell) for cell in edge["cells"])): edge["wall"]
+        for edge in data.get("edges", [])
+    }
+    for mark in marks.values():
+        cell = tuple(mark["cell"])
+        direction = NAMES.index(mark["direction"])
+        dx, dy = DIRECTIONS[direction]
+        # The observed cell is one tile from the wall sign. The next cell
+        # behind the robot is the two-tile shooting position.
+        candidates = [(1, cell), (2, (cell[0] - dx, cell[1] - dy))]
+        mark["shooting_positions"] = [
+            {"distance_tiles": distance, "cell": list(position),
+             "facing": mark["direction"]}
+            for distance, position in candidates
+            if 0 <= position[0] < rows and 0 <= position[1] < columns
+            and position in visited
+            and (distance == 1 or known_edges.get(tuple(sorted((cell, position)))) is False)
+        ]
     data["signs"] = sorted(
         marks.values(),
         key=lambda item: (item["cell"][0], item["cell"][1], item["direction"],
@@ -219,6 +244,31 @@ def save_sign_marks(output, marks):
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     temp.replace(path)
+
+
+def assign_sign_instance(instance_tracks, cell, direction, detection):
+    """Associate detections by color and image position so equal signs stay distinct."""
+    color_key = (tuple(cell), direction, detection["color"])
+    tracks = instance_tracks.setdefault(color_key, [])
+    center = detection["center_norm"]
+    best = None
+    best_distance = float("inf")
+    for track in tracks:
+        distance = math.hypot(center[0] - track["center"][0],
+                              center[1] - track["center"][1])
+        if distance < best_distance:
+            best, best_distance = track, distance
+    if best is None or best_distance > 0.20:
+        instance_id = len(tracks)
+        tracks.append({"id": instance_id, "center": tuple(center), "observations": 1})
+        return instance_id
+    count = best["observations"]
+    best["center"] = (
+        (best["center"][0] * count + center[0]) / (count + 1),
+        (best["center"][1] * count + center[1]) / (count + 1),
+    )
+    best["observations"] = count + 1
+    return best["id"]
 
 
 def render_map_image(map_file):
@@ -367,8 +417,10 @@ def render_map_image(map_file):
 def run_camera_loop(explorer, camera, camera_is_robot, stop_motion=None):
     outcome = {"completed": False, "error": None}
     sign_marks = {}
+    instance_tracks = {}
     confirmation_streaks = {}
-    inspection = {"active": False}
+    current_inspection_id = None
+    inspection = {"active": False, "inspection_id": 0}
     inspection_lock = threading.Lock()
     inspection_finished = threading.Event()
 
@@ -419,28 +471,63 @@ def run_camera_loop(explorer, camera, camera_is_robot, stop_motion=None):
 
                 valid_candidates = set()
                 if valid_wall_distance is not None:
+                    inspection_id = active_inspection.get("inspection_id")
+                    if inspection_id != current_inspection_id:
+                        confirmation_streaks.clear()
+                        current_inspection_id = inspection_id
                     for detection in detections:
+                        if (detection["shape"] == "Unknown"
+                                or detection["shape_confidence"] < MIN_SHAPE_CONFIDENCE):
+                            continue
+                        instance_id = assign_sign_instance(
+                            instance_tracks, current_cell, current_direction, detection
+                        )
                         key = (current_cell, current_direction,
-                               detection["color"], detection["shape"])
+                               detection["color"], detection["shape"], instance_id)
                         if key in valid_candidates:
                             continue
                         valid_candidates.add(key)
-                        streak = confirmation_streaks.get(key, 0) + 1
-                        confirmation_streaks[key] = streak
-                        if streak >= SIGN_CONFIRMATION_FRAMES:
+                        evidence = confirmation_streaks.setdefault(
+                            key, {"frames": 0, "views": set(), "confidences": []}
+                        )
+                        evidence["frames"] += 1
+                        evidence["views"].add(round(active_inspection.get("view_offset", 0)))
+                        evidence["confidences"].append(detection["shape_confidence"])
+                        confirmed = (
+                            evidence["frames"] >= SIGN_CONFIRMATION_FRAMES
+                            and len(evidence["views"]) >= 2
+                        )
+                        if confirmed:
                             mark = sign_marks.get(key)
                             if mark is None:
                                 mark = {
                                     "color": detection["color"],
                                     "shape": detection["shape"],
+                                    "instance_id": instance_id,
                                     "cell": list(current_cell),
                                     "direction": NAMES[current_direction],
                                     "tof_distances_mm": [],
-                                    "confirmed_frames": streak,
+                                    "confirmed_frames": evidence["frames"],
+                                    "view_offsets_deg": sorted(evidence["views"]),
+                                    "shape_confidence": round(float(np.mean(
+                                        evidence["confidences"])), 3),
+                                    "observation_count": 0,
+                                    "image_center_norm": [],
                                 }
                                 sign_marks[key] = mark
-                            elif streak > SIGN_CONFIRMATION_FRAMES:
+                            elif evidence["frames"] > SIGN_CONFIRMATION_FRAMES:
                                 mark["confirmed_frames"] += 1
+                            mark["observation_count"] += 1
+                            mark["shape_confidence"] = round(float(np.mean(
+                                evidence["confidences"])), 3)
+                            mark["view_offsets_deg"] = sorted(evidence["views"])
+                            center_norm = detection.get("center_norm")
+                            if center_norm is not None:
+                                mark["image_center_norm"].append([
+                                    round(float(center_norm[0]), 4),
+                                    round(float(center_norm[1]), 4),
+                                ])
+                                mark["image_center_norm"] = mark["image_center_norm"][-15:]
                             mark["tof_distances_mm"].append(
                                 round(valid_wall_distance, 1)
                             )
@@ -450,11 +537,9 @@ def run_camera_loop(explorer, camera, camera_is_robot, stop_motion=None):
                             )
                             mark["last_seen_timestamp"] = time.time()
                     confirmation_streaks = {
-                        key: streak for key, streak in confirmation_streaks.items()
+                        key: evidence for key, evidence in confirmation_streaks.items()
                         if key in valid_candidates
                     }
-                else:
-                    confirmation_streaks.clear()
 
                 if active_inspection is not None:
                     with inspection_lock:
@@ -462,9 +547,13 @@ def run_camera_loop(explorer, camera, camera_is_robot, stop_motion=None):
                             inspection["frame_count"] += 1
 
                 gate_text = (
-                    "WALL VERIFIED - LOOKING DOWN: sign {}/{} frames | marked {}"
-                    .format(max(confirmation_streaks.values(), default=0),
-                            SIGN_CONFIRMATION_FRAMES, len(sign_marks))
+                    "WALL VERIFIED: sign {}/{} frames, {} views | marked {}"
+                    .format(max((item["frames"] for item in confirmation_streaks.values()),
+                                default=0),
+                            SIGN_CONFIRMATION_FRAMES,
+                            max((len(item["views"])
+                                 for item in confirmation_streaks.values()), default=0),
+                            len(sign_marks))
                     if active_inspection is not None
                     else "WAITING FOR FRONT WALL SCAN - signs are not marked"
                 )
@@ -516,19 +605,26 @@ def run_camera_loop(explorer, camera, camera_is_robot, stop_motion=None):
     return outcome["completed"]
 
 
-def run_simulation(camera_index, output):
-    from SLAM.src.slam_simulation import SimulationBackend
-
+def run_camera_preview(camera_index):
+    """Show the detector from a local camera without starting SLAM or motion."""
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
         camera.release()
         raise RuntimeError("Cannot open webcam/camera index {}".format(camera_index))
-
-    explorer = DFSExplorer(SimulationBackend(), output)
     try:
-        return run_camera_loop(explorer, camera, camera_is_robot=False)
+        print("Camera preview only. Press 'q' to close; no SLAM map will be written.")
+        while True:
+            ok, frame = camera.read()
+            if ok and frame is not None:
+                result, mask, _ = detect_signs(frame)
+                cv2.imshow("Sign Detection Preview", result)
+                cv2.imshow("Detected Sign Mask", mask)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+        return True
     finally:
         camera.release()
+        cv2.destroyAllWindows()
 
 
 def run_hardware(conn_type, calibration_path, output):
@@ -550,7 +646,7 @@ def run_hardware(conn_type, calibration_path, output):
         print("Front-wall stopping target: {:.0f} mm (plus configured stop tolerance)."
               .format(system.thread_2_controller.wall_pid.front_target_mm))
         system.thread_1_sensor.start_collecting()
-        system.thread_2_controller._running.set()
+        system.thread_2_controller.enable_motion()
 
         deadline = time.monotonic() + setting("slam.sensor_timeout_sec")
         while system.sensor_hub.get_latest_state().frame_index == 0:
@@ -584,7 +680,7 @@ def main():
         description="Explore a maze with Grid SLAM while detecting signs from the camera"
     )
     parser.add_argument("--mock", action="store_true",
-                        help="Run the SLAM simulator and show a PC webcam")
+                        help="Preview sign detection from a PC webcam (no SLAM or motion)")
     parser.add_argument("--camera-index", type=int, default=0,
                         help="PC webcam index used with --mock")
     parser.add_argument("--conn-type", choices=("ap", "sta"),
@@ -599,6 +695,13 @@ def main():
     calibration_path = Path(args.calibration)
     if not calibration_path.is_absolute():
         calibration_path = PROJECT_ROOT / "SLAM" / calibration_path
+
+    if args.mock:
+        try:
+            return 0 if run_camera_preview(args.camera_index) else 1
+        except (OSError, RuntimeError, ValueError) as error:
+            print("Mission error: {}".format(error))
+            return 1
 
     if args.output:
         output_path = Path(args.output)
@@ -615,10 +718,7 @@ def main():
     print("Mission output folder: {}".format(output_path.parent))
 
     try:
-        if args.mock:
-            success = run_simulation(args.camera_index, output_path)
-        else:
-            success = run_hardware(args.conn_type, calibration_path, output_path)
+        success = run_hardware(args.conn_type, calibration_path, output_path)
         image_path = render_map_image(output_path)
         print("Map image saved to: {}".format(image_path))
         return 0 if success else 1
